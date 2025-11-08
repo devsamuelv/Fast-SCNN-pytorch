@@ -6,11 +6,14 @@
 
 """Fast Segmentation Convolutional Neural Network"""
 import os
+import struct
+from typing import List, Tuple
 import torch
+import torch.jit as jit
 import torch.nn as nn
 import torch.nn.functional as F
 
-__all__ = ['FastSCNN', 'get_fast_scnn']
+__all__ = ["FastSCNN", "get_fast_scnn"]
 
 
 class FastSCNN(nn.Module):
@@ -18,7 +21,9 @@ class FastSCNN(nn.Module):
         super(FastSCNN, self).__init__()
         self.aux = aux
         self.learning_to_downsample = LearningToDownsample(32, 48, 64)
-        self.global_feature_extractor = GlobalFeatureExtractor(64, [64, 96, 128], 128, 6, [3, 3, 3])
+        self.global_feature_extractor = GlobalFeatureExtractor(
+            64, [64, 96, 128], 128, 6, [3, 3, 3]
+        )
         self.feature_fusion = FeatureFusionModule(64, 128, 128)
         self.classifier = Classifer(128, num_classes)
         if self.aux:
@@ -27,34 +32,47 @@ class FastSCNN(nn.Module):
                 nn.BatchNorm2d(32),
                 nn.ReLU(True),
                 nn.Dropout(0.1),
-                nn.Conv2d(32, num_classes, 1)
+                nn.Conv2d(32, num_classes, 1),
             )
 
     def forward(self, x):
         size = x.size()[2:]
+        # X Must be converted from float to byte
         higher_res_features = self.learning_to_downsample(x)
         x = self.global_feature_extractor(higher_res_features)
         x = self.feature_fusion(higher_res_features, x)
         x = self.classifier(x)
-        outputs = []
-        x = F.interpolate(x, size, mode='bilinear', align_corners=True)
-        outputs.append(x)
-        if self.aux:
+        outputs: list[torch.Tensor] = []
+        x = F.interpolate(x, size, mode="bilinear", align_corners=True)
+        # outputs.append(x)
+        # if self.aux:
+        #     auxout = self.auxlayer(higher_res_features)
+        #     auxout = F.interpolate(auxout, size, mode="bilinear", align_corners=True)
+        #     outputs.append(auxout)
+        # return tuple(outputs)
+
+        # there was a check to make sure aux wasnt null but it was removed, add a torchscript version for that condition please future me.
+        if hasattr(self, "auxlayer"):
             auxout = self.auxlayer(higher_res_features)
-            auxout = F.interpolate(auxout, size, mode='bilinear', align_corners=True)
-            outputs.append(auxout)
-        return tuple(outputs)
+            auxout = F.interpolate(auxout, size, mode="bilinear", align_corners=True)
+        else:
+            auxout = None
+        return x, auxout
 
 
 class _ConvBNReLU(nn.Module):
     """Conv-BN-ReLU"""
 
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0, **kwargs):
+    def __init__(
+        self, in_channels, out_channels, kernel_size=3, stride=1, padding=0, **kwargs
+    ):
         super(_ConvBNReLU, self).__init__()
         self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=False),
+            nn.Conv2d(
+                in_channels, out_channels, kernel_size, stride, padding, bias=False
+            ),
             nn.BatchNorm2d(out_channels),
-            nn.ReLU(True)
+            nn.ReLU(True),
         )
 
     def forward(self, x):
@@ -67,12 +85,14 @@ class _DSConv(nn.Module):
     def __init__(self, dw_channels, out_channels, stride=1, **kwargs):
         super(_DSConv, self).__init__()
         self.conv = nn.Sequential(
-            nn.Conv2d(dw_channels, dw_channels, 3, stride, 1, groups=dw_channels, bias=False),
+            nn.Conv2d(
+                dw_channels, dw_channels, 3, stride, 1, groups=dw_channels, bias=False
+            ),
             nn.BatchNorm2d(dw_channels),
             nn.ReLU(True),
             nn.Conv2d(dw_channels, out_channels, 1, bias=False),
             nn.BatchNorm2d(out_channels),
-            nn.ReLU(True)
+            nn.ReLU(True),
         )
 
     def forward(self, x):
@@ -83,9 +103,11 @@ class _DWConv(nn.Module):
     def __init__(self, dw_channels, out_channels, stride=1, **kwargs):
         super(_DWConv, self).__init__()
         self.conv = nn.Sequential(
-            nn.Conv2d(dw_channels, out_channels, 3, stride, 1, groups=dw_channels, bias=False),
+            nn.Conv2d(
+                dw_channels, out_channels, 3, stride, 1, groups=dw_channels, bias=False
+            ),
             nn.BatchNorm2d(out_channels),
-            nn.ReLU(True)
+            nn.ReLU(True),
         )
 
     def forward(self, x):
@@ -105,7 +127,7 @@ class LinearBottleneck(nn.Module):
             _DWConv(in_channels * t, in_channels * t, stride),
             # pw-linear
             nn.Conv2d(in_channels * t, out_channels, 1, bias=False),
-            nn.BatchNorm2d(out_channels)
+            nn.BatchNorm2d(out_channels),
         )
 
     def forward(self, x):
@@ -126,20 +148,24 @@ class PyramidPooling(nn.Module):
         self.conv3 = _ConvBNReLU(in_channels, inter_channels, 1, **kwargs)
         self.conv4 = _ConvBNReLU(in_channels, inter_channels, 1, **kwargs)
         self.out = _ConvBNReLU(in_channels * 2, out_channels, 1)
+        self.pool1 = nn.AdaptiveAvgPool2d(1)
+        self.pool2 = nn.AdaptiveAvgPool2d(2)
+        self.pool3 = nn.AdaptiveAvgPool2d(3)
+        self.pool6 = nn.AdaptiveAvgPool2d(6)
 
     def pool(self, x, size):
         avgpool = nn.AdaptiveAvgPool2d(size)
         return avgpool(x)
 
-    def upsample(self, x, size):
-        return F.interpolate(x, size, mode='bilinear', align_corners=True)
+    def upsample(self, x, size: List[int]) -> torch.Tensor:
+        return F.interpolate(x, size, mode="bilinear", align_corners=True)
 
     def forward(self, x):
         size = x.size()[2:]
-        feat1 = self.upsample(self.conv1(self.pool(x, 1)), size)
-        feat2 = self.upsample(self.conv2(self.pool(x, 2)), size)
-        feat3 = self.upsample(self.conv3(self.pool(x, 3)), size)
-        feat4 = self.upsample(self.conv4(self.pool(x, 6)), size)
+        feat1 = self.upsample(self.conv1(self.pool1(x)), size)
+        feat2 = self.upsample(self.conv2(self.pool2(x)), size)
+        feat3 = self.upsample(self.conv3(self.pool3(x)), size)
+        feat4 = self.upsample(self.conv4(self.pool6(x)), size)
         x = torch.cat([x, feat1, feat2, feat3, feat4], dim=1)
         x = self.out(x)
         return x
@@ -150,7 +176,7 @@ class LearningToDownsample(nn.Module):
 
     def __init__(self, dw_channels1=32, dw_channels2=48, out_channels=64, **kwargs):
         super(LearningToDownsample, self).__init__()
-        self.conv = _ConvBNReLU(3, dw_channels1, 3, 2)
+        self.conv = _ConvBNReLU(3, dw_channels1, 3, stride=2)
         self.dsconv1 = _DSConv(dw_channels1, dw_channels2, 2)
         self.dsconv2 = _DSConv(dw_channels2, out_channels, 2)
 
@@ -164,12 +190,25 @@ class LearningToDownsample(nn.Module):
 class GlobalFeatureExtractor(nn.Module):
     """Global feature extractor module"""
 
-    def __init__(self, in_channels=64, block_channels=(64, 96, 128),
-                 out_channels=128, t=6, num_blocks=(3, 3, 3), **kwargs):
+    def __init__(
+        self,
+        in_channels=64,
+        block_channels=(64, 96, 128),
+        out_channels=128,
+        t=6,
+        num_blocks=(3, 3, 3),
+        **kwargs
+    ):
         super(GlobalFeatureExtractor, self).__init__()
-        self.bottleneck1 = self._make_layer(LinearBottleneck, in_channels, block_channels[0], num_blocks[0], t, 2)
-        self.bottleneck2 = self._make_layer(LinearBottleneck, block_channels[0], block_channels[1], num_blocks[1], t, 2)
-        self.bottleneck3 = self._make_layer(LinearBottleneck, block_channels[1], block_channels[2], num_blocks[2], t, 1)
+        self.bottleneck1 = self._make_layer(
+            LinearBottleneck, in_channels, block_channels[0], num_blocks[0], t, 2
+        )
+        self.bottleneck2 = self._make_layer(
+            LinearBottleneck, block_channels[0], block_channels[1], num_blocks[1], t, 2
+        )
+        self.bottleneck3 = self._make_layer(
+            LinearBottleneck, block_channels[1], block_channels[2], num_blocks[2], t, 1
+        )
         self.ppm = PyramidPooling(block_channels[2], out_channels)
 
     def _make_layer(self, block, inplanes, planes, blocks, t=6, stride=1):
@@ -190,27 +229,42 @@ class GlobalFeatureExtractor(nn.Module):
 class FeatureFusionModule(nn.Module):
     """Feature fusion module"""
 
-    def __init__(self, highter_in_channels, lower_in_channels, out_channels, scale_factor=4, **kwargs):
+    def __init__(
+        self,
+        highter_in_channels,
+        lower_in_channels,
+        out_channels,
+        scale_factor=4,
+        **kwargs
+    ):
         super(FeatureFusionModule, self).__init__()
         self.scale_factor = scale_factor
         self.dwconv = _DWConv(lower_in_channels, out_channels, 1)
         self.conv_lower_res = nn.Sequential(
-            nn.Conv2d(out_channels, out_channels, 1),
-            nn.BatchNorm2d(out_channels)
+            nn.Conv2d(out_channels, out_channels, 1), nn.BatchNorm2d(out_channels)
         )
         self.conv_higher_res = nn.Sequential(
             nn.Conv2d(highter_in_channels, out_channels, 1),
-            nn.BatchNorm2d(out_channels)
+            nn.BatchNorm2d(out_channels),
         )
         self.relu = nn.ReLU(True)
 
     def forward(self, higher_res_feature, lower_res_feature):
-        lower_res_feature = F.interpolate(lower_res_feature, scale_factor=4, mode='bilinear', align_corners=True)
+        lower_res_feature = F.interpolate(
+            lower_res_feature, scale_factor=4.0, mode="bilinear", align_corners=True
+        )
         lower_res_feature = self.dwconv(lower_res_feature)
         lower_res_feature = self.conv_lower_res(lower_res_feature)
-
         higher_res_feature = self.conv_higher_res(higher_res_feature)
-        out = higher_res_feature + lower_res_feature
+
+        # Resizing the lower resulution tensor to the size of the higher resolution tensor. resize_ is unsupported in torchscript
+        # out = higher_res_feature + lower_res_feature.resize_(higher_res_feature.size())
+        out = higher_res_feature + F.interpolate(
+            lower_res_feature,
+            size=higher_res_feature.shape[2:],
+            mode="bilinear",
+            align_corners=True,
+        )
         return self.relu(out)
 
 
@@ -222,8 +276,7 @@ class Classifer(nn.Module):
         self.dsconv1 = _DSConv(dw_channels, dw_channels, stride)
         self.dsconv2 = _DSConv(dw_channels, dw_channels, stride)
         self.conv = nn.Sequential(
-            nn.Dropout(0.1),
-            nn.Conv2d(dw_channels, num_classes, 1)
+            nn.Dropout(0.1), nn.Conv2d(dw_channels, num_classes, 1)
         )
 
     def forward(self, x):
@@ -233,25 +286,35 @@ class Classifer(nn.Module):
         return x
 
 
-def get_fast_scnn(dataset='citys', pretrained=False, root='./weights', map_cpu=False, **kwargs):
+def get_fast_scnn(
+    dataset="citys", pretrained=False, root="./weights", map_cpu=False, **kwargs
+):
     acronyms = {
-        'pascal_voc': 'voc',
-        'pascal_aug': 'voc',
-        'ade20k': 'ade',
-        'coco': 'coco',
-        'citys': 'citys',
+        "pascal_voc": "voc",
+        "pascal_aug": "voc",
+        "ade20k": "ade",
+        "coco": "coco",
+        "citys": "citys",
     }
     from data_loader import datasets
+
     model = FastSCNN(datasets[dataset].NUM_CLASS, **kwargs)
     if pretrained:
-        if(map_cpu):
-            model.load_state_dict(torch.load(os.path.join(root, 'fast_scnn_%s.pth' % acronyms[dataset]), map_location='cpu'))
+        if map_cpu:
+            model.load_state_dict(
+                torch.load(
+                    os.path.join(root, "fast_scnn_%s.pth" % acronyms[dataset]),
+                    map_location="cpu",
+                )
+            )
         else:
-            model.load_state_dict(torch.load(os.path.join(root, 'fast_scnn_%s.pth' % acronyms[dataset])))
+            model.load_state_dict(
+                torch.load(os.path.join(root, "fast_scnn_%s.pth" % acronyms[dataset]))
+            )
     return model
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     img = torch.randn(2, 3, 256, 512)
-    model = get_fast_scnn('citys')
+    model = get_fast_scnn("citys")
     outputs = model(img)

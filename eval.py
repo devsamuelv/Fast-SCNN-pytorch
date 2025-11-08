@@ -40,7 +40,7 @@ class Evaluator(object):
         for i, (image, label) in enumerate(self.val_loader):
             image = image.to(self.args.device)
 
-            outputs = self.model(image)
+            outputs = self.model([image])
 
             pred = torch.argmax(outputs[0], 1)
             pred = pred.cpu().data.numpy()

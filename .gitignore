@@ -5,6 +5,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+index.html
+cookies.txt
+leftImg8bit/
+
 # C extensions
 *.so
 
